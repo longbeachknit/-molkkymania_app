@@ -1540,6 +1540,7 @@ function fmtEventPeriod(tour){
      ③ ①②のあとも、前回から60秒たっていれば
    ==================================================================== */
 const LIVE_MIN_INTERVAL=60000;   // 60秒より短い間隔では取りに行かない
+const LIVE_RETRY_WAIT=15000;     // 通信に失敗したときは、15秒あけてから次を試す
 const LS_SEL_LIVE='mm12_selected_live';
 let _lastPhaseForLive='';        // 直前に見ていた画面（ホーム以外）
 
@@ -1582,6 +1583,10 @@ async function refreshLiveEvent(){
         S._liveTourId=null;
         S._liveEventCode=''; // 開催中なし、または まだ選んでいない
       }
+    }else if(S._liveEventCode===undefined){
+      // 通信できず、まだ一度も取れていない。「読み込み中…」のまま止まらないよう、
+      // いったん「開催中なし」として表示を確定させる（次の機会にまた取りに行く）。
+      S._liveEventCode='';
     }
   }catch(e){/* 取得失敗時は前回の値を維持 */}
   finally{
@@ -1594,8 +1599,12 @@ function maybeRefreshLiveEvent(){
   if(_liveEvtBusy)return;
   const backToHome=(_lastPhaseForLive!=='');   // 他の画面から戻ってきた
   _lastPhaseForLive='';
-  if(S._liveEventCode===undefined){refreshLiveEvent();return;}   // ①はじめて開いた
   const waited=Date.now()-_liveEvtTs;
+  if(S._liveEventCode===undefined){
+    // ①はじめて開いた。※通信に失敗した直後は少し待つ（失敗しつづける状況で連打しないため）
+    if(_liveEvtTs===0||waited>LIVE_RETRY_WAIT)refreshLiveEvent();
+    return;
+  }
   if(backToHome&&waited>3000){refreshLiveEvent();return;}         // ②戻ってきた
   if(waited>LIVE_MIN_INTERVAL)refreshLiveEvent();                 // ③60秒経過
 }
