@@ -92,7 +92,7 @@ const MAX=50,RST=25,MM=3,TURN_LIMIT=12;
 // ===== アプリのバージョン表記 =====
 // ファイル名（例: molkky_final_7_10.html）から自動でバージョン番号を取り出します。
 // 「7_10」や「7-10」→「7_10」と表示。読み取れないときは下の値を使います。
-const APP_VERSION_FALLBACK='1_1';
+const APP_VERSION_FALLBACK='1_2';
 const APP_VERSION=(function(){
   try{
     // 新しい名前（molkkymania_app_1_1.html）と、旧い名前（mölkky_final_8_4.html）の両対応
@@ -416,7 +416,7 @@ async function checkAdminPw(pw){
 //   raw は生JSONをそのまま返す（base64デコード不要）。
 const GITHUB_RAW_BASE='https://raw.githubusercontent.com/longbeachknit/molkkymania-deta/main';
 const GITHUB_DATA_BASE='https://api.github.com/repos/longbeachknit/molkkymania-deta/contents'; // 書き込み(PUT)用に残す
-const CACHE_TTL=20000; // 20秒キャッシュ
+const CACHE_TTL=60000; // 【1-2】60秒キャッシュ（同じデータを何度も取りに行かないようにする）
 const _jsonCache={};
 
 /* ===== 【1-1】大会データの読み取り先をデータベース（Supabase）に変更 ==========
@@ -445,24 +445,80 @@ function sbEventFilter(eventCode){
     : 'event_code=eq.'+encodeURIComponent(s);
 }
 
+/* ===== 【1-2】通信量を減らすしくみ ===================================
+   ① まず「最終更新の日時」だけを聞きに行く（数百バイト）
+   ② 前回と同じなら、中身は取りに行かない（端末に覚えてある控えを使う）
+   ③ 通信できなくても、控えがあればそれを表示する（電波が悪くても見られる）
+   ===================================================================== */
+const LS_DOC='mm12_doc_';          // 控えの保存名の頭につける文字
+const LS_DOC_MAX=1200000;          // これより大きい中身は控えを取らない（保存領域を守るため）
+
+function lsDocGet(k){
+  try{const s=localStorage.getItem(LS_DOC+k);return s?JSON.parse(s):null;}catch(e){return null;}
+}
+function lsDocSet(k,stamp,payload){
+  let s;
+  try{s=JSON.stringify({t:stamp,p:payload});}catch(e){return;}
+  if(s.length>LS_DOC_MAX)return;
+  try{localStorage.setItem(LS_DOC+k,s);}
+  catch(e){
+    // 保存領域がいっぱい：古い控えを全部消してから、1回だけやり直す
+    try{
+      Object.keys(localStorage).forEach(x=>{if(x.indexOf(LS_DOC)===0)localStorage.removeItem(x);});
+      localStorage.setItem(LS_DOC+k,s);
+    }catch(e2){}
+  }
+}
+
+// 「最終更新の日時」だけを取りに行く（中身は取らない）。無ければ null。
+async function sbFetchStamp(path){
+  const res=await fetch(SB_URL+'/rest/v1/'+path,{cache:'no-store',headers:sbHeaders()});
+  if(!res.ok)throw new Error('HTTP '+res.status);
+  const rows=await res.json();
+  if(!rows||!rows.length)return null;
+  return String(rows[0].updated_at||'');
+}
+
 async function sbFetchDoc(eventCode,kind){
   const f=sbEventFilter(eventCode);
   if(!f)throw new Error('大会コードが空です');
-  const url=SB_URL+'/rest/v1/event_docs?'+f+'&kind=eq.'+encodeURIComponent(kind)+'&select=payload&limit=1';
-  const res=await fetch(url,{cache:'no-store',headers:sbHeaders()});
-  if(!res.ok)throw new Error('HTTP '+res.status);
-  const rows=await res.json();
-  if(!rows||!rows.length)throw new Error('まだ配信されていません');
-  return rows[0].payload;
+  const q=f+'&kind=eq.'+encodeURIComponent(kind);
+  const lsKey=q;
+  const cached=lsDocGet(lsKey);
+  try{
+    const stamp=await sbFetchStamp('event_docs?'+q+'&select=updated_at&limit=1');
+    if(stamp===null)throw new Error('まだ配信されていません');
+    if(cached&&cached.t===stamp)return cached.p;   // 変わっていない → 中身は取りに行かない
+    const res=await fetch(SB_URL+'/rest/v1/event_docs?'+q+'&select=payload&limit=1',{cache:'no-store',headers:sbHeaders()});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const rows=await res.json();
+    if(!rows||!rows.length)throw new Error('まだ配信されていません');
+    lsDocSet(lsKey,stamp,rows[0].payload);
+    return rows[0].payload;
+  }catch(e){
+    if(cached)return cached.p;   // 通信できなくても、前回の内容を見せる
+    throw e;
+  }
 }
 
 async function sbFetchVenue(code){
-  const url=SB_URL+'/rest/v1/venue_docs?venue_code=eq.'+encodeURIComponent(String(code))+'&select=payload&limit=1';
-  const res=await fetch(url,{cache:'no-store',headers:sbHeaders()});
-  if(!res.ok)throw new Error('HTTP '+res.status);
-  const rows=await res.json();
-  if(!rows||!rows.length)throw new Error('会場データがありません');
-  return rows[0].payload;
+  const q='venue_code=eq.'+encodeURIComponent(String(code));
+  const lsKey='venue|'+q;
+  const cached=lsDocGet(lsKey);
+  try{
+    const stamp=await sbFetchStamp('venue_docs?'+q+'&select=updated_at&limit=1');
+    if(stamp===null)throw new Error('会場データがありません');
+    if(cached&&cached.t===stamp)return cached.p;
+    const res=await fetch(SB_URL+'/rest/v1/venue_docs?'+q+'&select=payload&limit=1',{cache:'no-store',headers:sbHeaders()});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const rows=await res.json();
+    if(!rows||!rows.length)throw new Error('会場データがありません');
+    lsDocSet(lsKey,stamp,rows[0].payload);
+    return rows[0].payload;
+  }catch(e){
+    if(cached)return cached.p;
+    throw e;
+  }
 }
 
 // ===== メンバー名の難読化（GitHub上のJSONで本名が直接読めないようにする） =====
@@ -1419,7 +1475,7 @@ function textSafeColor(hex,fallback){
 function venueHasDetail(v){
   if(!v||!v.detail)return false;
   const d=v.detail;
-  if(d.locationName||d.address||d.mapUrl||d.access||d.parking||d.toilet||d.smoking||d.garbage||d.rules||d.mapImage)return true;
+  if(d.locationName||d.address||d.mapUrl||d.access||d.parking||d.toilet||d.smoking||d.garbage||d.rules||d.mapImage||d.mapImageUrl)return true;
   if(Array.isArray(d.notes)&&d.notes.length)return true;
   if(Array.isArray(d.sections)&&d.sections.length)return true;
   return false;
@@ -1473,21 +1529,59 @@ function fmtEventPeriod(tour){
   return dateJa(s)+(timeJa(s)?' '+timeJa(s):'')+' 〜 '+dateJa(e)+(timeJa(e)?' '+timeJa(e):'');
 }
 
-// ===== 「今まさに開催中（配信中）の大会」をAPIで解決してホームに反映 =====
-// active.json は api.github.com 直・キャッシュ無しで取得するためラグはほぼ無い。
+/* ===== 【1-2】「いま開催中の大会」の扱い ==============================
+   ・開催中リストはデータベース側にあり、いくつでも同時に入れられる。
+   ・1つだけのときは、今までと全く同じ動き（選ぶ画面は出ない）。
+   ・2つ以上のときは、ホームでどちらを見るか選んでもらい、その選択を覚える。
+
+   取りに行くタイミングは次の3つだけ（通信量を減らすため）：
+     ① ホーム画面を最初に開いたとき
+     ② 他の画面から、ホームに戻ってきたとき
+     ③ ①②のあとも、前回から60秒たっていれば
+   ==================================================================== */
+const LIVE_MIN_INTERVAL=60000;   // 60秒より短い間隔では取りに行かない
+const LS_SEL_LIVE='mm12_selected_live';
+let _lastPhaseForLive='';        // 直前に見ていた画面（ホーム以外）
+
+function getSelectedLiveKey(){
+  try{return localStorage.getItem(LS_SEL_LIVE)||'';}catch(e){return '';}
+}
+function setSelectedLiveKey(k){
+  try{ if(k)localStorage.setItem(LS_SEL_LIVE,k); else localStorage.removeItem(LS_SEL_LIVE); }catch(e){}
+}
+// 開催中リストの中から「この端末が見る大会」を1つ決める。
+//   ・選択済みで、それがまだ開催中 → それ
+//   ・未選択で、開催中が1つだけ    → それ（＝今までと同じ動き）
+//   ・未選択で、開催中が2つ以上    → null（ホームで選んでもらう）
+function pickLiveRow(list){
+  const rows=list||[];
+  let sel=getSelectedLiveKey();
+  if(sel&&!rows.some(r=>String(r.event_key)===sel)){sel='';setSelectedLiveKey('');}
+  if(!sel&&rows.length===1)sel=String(rows[0].event_key||'');
+  return rows.find(r=>String(r.event_key)===sel)||null;
+}
+
 let _liveEvtTs=0,_liveEvtBusy=false;
 async function refreshLiveEvent(){
   if(_liveEvtBusy)return;
   _liveEvtBusy=true;
   try{
-    const code=await resolveActiveEventCode();
-    if(code){
-      await syncAllFromGitHub(code);
-      const t=(AD.tournaments||[]).find(x=>x.eventCode===code);
-      if(t){AD.activeTourId=t.id;saveAdmin(AD);}
-      S._liveEventCode=code;
-    }else{
-      S._liveEventCode=''; // 開催中の大会なし
+    const info=await fetchActiveEvent();
+    if(info){
+      const list=info.liveEvents||[];
+      S._liveEvents=list;
+      const row=pickLiveRow(list);
+      if(row){
+        const code=String(row.event_code||'');
+        await syncAllFromGitHub(String(row.event_key||code));
+        const t=(AD.tournaments||[]).find(x=>String(x.venueCode||'')===String(row.venue_code||'')&&String(x.eventCode||'')===code)
+              ||(AD.tournaments||[]).find(x=>String(x.eventCode||'')===code);
+        if(t){AD.activeTourId=t.id;saveAdmin(AD);S._liveTourId=t.id;}else{S._liveTourId=null;}
+        S._liveEventCode=code;
+      }else{
+        S._liveTourId=null;
+        S._liveEventCode=''; // 開催中なし、または まだ選んでいない
+      }
     }
   }catch(e){/* 取得失敗時は前回の値を維持 */}
   finally{
@@ -1495,11 +1589,15 @@ async function refreshLiveEvent(){
     if(S.phase==='setup')render();
   }
 }
-// ホーム表示時に呼ぶ：未取得なら即時、取得済みでも15秒経過後に再取得（過剰取得を防ぐ）
+// ホームを描くたびに呼ばれる。上のルール①②③に当てはまるときだけ通信する。
 function maybeRefreshLiveEvent(){
   if(_liveEvtBusy)return;
-  if(S._liveEventCode===undefined){refreshLiveEvent();return;}
-  if(Date.now()-_liveEvtTs>15000)refreshLiveEvent();
+  const backToHome=(_lastPhaseForLive!=='');   // 他の画面から戻ってきた
+  _lastPhaseForLive='';
+  if(S._liveEventCode===undefined){refreshLiveEvent();return;}   // ①はじめて開いた
+  const waited=Date.now()-_liveEvtTs;
+  if(backToHome&&waited>3000){refreshLiveEvent();return;}         // ②戻ってきた
+  if(waited>LIVE_MIN_INTERVAL)refreshLiveEvent();                 // ③60秒経過
 }
 
 function sendRowViaImage(params){
@@ -2243,6 +2341,8 @@ async function startQRScan(mode){
 function render(){
   const app=document.getElementById('app');
   const p=S.phase;
+  // 【1-2】ホーム以外の画面に移ったことを覚えておく（戻ってきたときに最新を取りに行くため）
+  if(p!=='setup')_lastPhaseForLive=p;
   if(p==='setup')app.innerHTML=rSetup();
   else if(p==='firstChoice')app.innerHTML=rFirst();
   else if(p==='orderSetup')app.innerHTML=rOrder();
@@ -2755,7 +2855,10 @@ function rSetup(){
   // 「今まさに開催中（配信中）の大会」をAPIで解決してから表示する
   maybeRefreshLiveEvent();
   const _liveCode=S._liveEventCode; // undefined=取得中 / ''=開催なし / コード=開催中
-  const _liveTour=(_liveCode&&_liveCode!=='')?((AD.tournaments||[]).find(t=>t.eventCode===_liveCode)||null):null;
+  const _liveTour=(_liveCode&&_liveCode!=='')
+    ?((S._liveTourId?(AD.tournaments||[]).find(t=>t.id===S._liveTourId):null)
+      ||(AD.tournaments||[]).find(t=>t.eventCode===_liveCode)||null)
+    :null;
 
   // 受付済みチームの保持状態（開催中の大会に対して照合）
   const _my=_liveTour?getValidMyTeam(_liveTour.eventCode):null;
@@ -2827,12 +2930,38 @@ function rSetup(){
     </div>
   </div>`;
 
+  /* 【1-2】同じ日に2つ以上の大会が開催中のとき、どちらを見るか選んでもらう。
+       開催中が1つだけのときは、この画面は出ません（今までと全く同じ表示）。 */
+  const _lives=S._liveEvents||[];
+  const _needPick=(_lives.length>=2&&!getSelectedLiveKey());
+  const _pickCard=r=>{
+    const t=(AD.tournaments||[]).find(x=>String(x.venueCode||'')===String(r.venue_code||'')&&String(x.eventCode||'')===String(r.event_code||''))
+          ||(AD.tournaments||[]).find(x=>String(x.eventCode||'')===String(r.event_code||''));
+    const v=(AD.venues||[]).find(x=>String(x.code)===String(r.venue_code||''));
+    const nm=escH(r.label||(t&&(t.displayName||t.eventName))||('大会 '+(r.event_code||''))).replace(/\\n/g,' ').replace(/\n/g,' ');
+    const vn=escH((v&&v.name)||'');
+    const col=(v&&v.themeColor)||'#FFC93D';
+    return`<button class="live-pick" data-key="${escH(r.event_key)}" style="display:block;width:100%;text-align:left;padding:14px 16px;margin-bottom:10px;background:${col}2E;border:1.5px solid ${col};border-radius:14px;cursor:pointer;">
+      <div style="font-size:17px;font-weight:800;color:#1a1a1a;line-height:1.35;">${nm}</div>
+      ${vn?`<div style="font-size:13px;color:#6b7280;margin-top:6px;">📍 ${vn}</div>`:''}
+      <div style="font-size:12px;color:#8a6d00;font-weight:800;margin-top:8px;">この大会を見る ▸</div>
+    </button>`;
+  };
+  const _switchBar=(_lives.length>=2&&getSelectedLiveKey())
+    ?`<div style="margin:-14px 0 18px;text-align:right;"><button id="btn-switch-live" style="font-size:12px;font-weight:700;color:#6b7280;background:#fff;border:1px solid #e5e7eb;border-radius:99px;padding:5px 12px;cursor:pointer;">🔄 大会を切り替える</button></div>`
+    :'';
+
   // 開催中の大会があるときだけカードを出す。無ければテンプレは表示しない。
-  const topBlock=_liveTour
-    ?_eventCard
-    :(_liveCode===''
-      ?`<div style="margin-bottom:20px;padding:18px 16px;background:#f9fafb;border:1px solid #eee;border-radius:14px;text-align:center;color:#9ca3af;font-size:13px;">現在、開催中の大会はありません。</div>`
-      :`<div style="margin-bottom:20px;padding:18px 16px;color:#c9c9c9;font-size:13px;text-align:center;">読み込み中…</div>`);
+  const topBlock=_needPick
+    ?`<div style="margin-bottom:20px;">
+        <div style="font-size:13px;font-weight:800;color:#8a6d00;margin-bottom:10px;">📣 いま${_lives.length}つの大会が開催中です。見たい方を選んでください。</div>
+        ${_lives.map(_pickCard).join('')}
+      </div>`
+    :(_liveTour
+      ?(_eventCard+_switchBar)
+      :(_liveCode===''
+        ?`<div style="margin-bottom:20px;padding:18px 16px;background:#f9fafb;border:1px solid #eee;border-radius:14px;text-align:center;color:#9ca3af;font-size:13px;">現在、開催中の大会はありません。</div>`
+        :`<div style="margin-bottom:20px;padding:18px 16px;color:#c9c9c9;font-size:13px;text-align:center;">読み込み中…</div>`));
 
   return`<div style="padding:8px 0 4px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:24px;">
@@ -3511,6 +3640,35 @@ function rAdminTop(){
         </details>`;
         return recentHtml+foldersHtml+unHtml;
       })()}
+    </div>
+
+    <div class="card" style="padding:14px;margin-bottom:12px;background:#EFF6FF;">
+      <div style="font-size:14px;font-weight:700;color:#1D4ED8;margin-bottom:6px;">📡 新アプリの「開催中リスト」（複数OK）</div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:10px;line-height:1.7;">
+        ここは<strong>新アプリ専用</strong>です。上の「📡 配信中にする」（従来アプリ用）とは<strong>別の仕組み</strong>で、
+        お互いに影響しません。<br>
+        チェックを入れた大会が、新アプリのホームに「開催中」として出ます。<strong>いくつでも同時に選べます。</strong>
+      </div>
+      <div style="font-size:12px;color:#374151;margin-bottom:3px;">配信キー（この端末にのみ保存されます）</div>
+      <input type="password" id="admin-sb-key" value="${escHtml(ad.sbSyncKey||'')}" placeholder="配信キーを貼り付け" style="font-size:13px;"/>
+      <div style="margin-top:10px;">
+        ${(()=>{
+          const list=(ad.tournaments||[]).filter(t=>t.eventCode);
+          if(!list.length)return'<div style="font-size:13px;color:#9ca3af;">大会がまだ登録されていません</div>';
+          const now=Array.isArray(S._liveEvents)?S._liveEvents.map(r=>String(r.event_key)):(ad.liveKeys||[]);
+          return list.map(t=>{
+            const key=(t.venueCode?t.venueCode+'_':'')+t.eventCode;
+            const vn=((ad.venues||[]).find(v=>v.code===t.venueCode)||{}).name||'';
+            return`<label style="display:flex;align-items:center;gap:9px;padding:7px 0;border-bottom:1px solid #f3f4f6;cursor:pointer;">
+              <input type="checkbox" class="admin-live-chk" data-key="${escHtml(key)}" ${now.indexOf(key)>=0?'checked':''} style="width:18px;height:18px;flex-shrink:0;"/>
+              <span style="flex:1;font-size:13px;line-height:1.4;">${escHtml(t.eventName||'（大会名未設定）')}
+                <span style="color:#9ca3af;font-size:11px;display:block;">${escHtml(vn||'場所未設定')} ／ ${escHtml(key)}</span></span>
+            </label>`;
+          }).join('');
+        })()}
+      </div>
+      <button class="btn btn-green" id="btn-save-live" style="width:100%;padding:10px;margin-top:12px;">📡 この内容で新アプリに反映する</button>
+      <div id="admin-live-msg" style="font-size:12px;margin-top:6px;min-height:16px;color:#6b7280;"></div>
     </div>
 
     <div class="card" style="padding:14px;margin-bottom:12px;background:#f0f9ff;">
@@ -4959,13 +5117,15 @@ async function publishActiveEvent(eventCode){
   }
 }
 
+let _liveMemo=null,_liveMemoTs=0;
+function clearLiveMemo(){_liveMemo=null;_liveMemoTs=0;}
 async function fetchActiveEvent(){
-  // 1回の取得処理（毎回URLを変えてSafari等の強いキャッシュをバイパス）
+  // 【1-2】30秒以内に同じ問い合わせが来たら、その答えを使い回す。
+  //   （試合開始・コート検索など複数の画面から呼ばれるため、まとめて節約できる）
+  if(_liveMemo&&(Date.now()-_liveMemoTs)<30000)return _liveMemo;
+  // 1回の取得処理
   const doFetch=async()=>{
-    // 【1-1】開催中の大会はデータベースから取得する。
-    //   ★live_events は複数行に対応している（同じ日に別会場で開催していても大丈夫）。
-    //     いまの画面は1件しか扱えないので、先頭の1件を今までと同じ形で返している。
-    //     一覧は liveEvents に入れてあるので、複数対応の画面を作るときはこれを使う。
+    // 開催中リストはデータベースから取得する。複数行に対応（同じ日に別会場でもOK）。
     const url=SB_URL+'/rest/v1/live_events?select=event_key,venue_code,event_code,label,sort_order&order=sort_order';
     const res=await fetch(url,{cache:'no-store',headers:sbHeaders()});
     if(!res.ok)throw new Error('HTTP '+res.status);
@@ -4977,18 +5137,17 @@ async function fetchActiveEvent(){
       liveEvents:      rows||[]
     };
   };
+  let out=null;
   try{
-    return await doFetch();
+    out=await doFetch();
   }catch(e1){
-    // 1回目失敗 → 0.5秒待って再試行（Safariのキャッシュ・一時的な通信エラー対策）
+    // 1回目失敗 → 0.5秒待って再試行（一時的な通信エラー対策）
     await new Promise(r=>setTimeout(r,500));
-    try{
-      return await doFetch();
-    }catch(e2){
-      console.warn('active.json取得失敗:',e2);
-      return null;
-    }
+    try{ out=await doFetch(); }
+    catch(e2){ console.warn('開催中リストの取得に失敗:',e2); return null; }
   }
+  _liveMemo=out;_liveMemoTs=Date.now();
+  return out;
 }
 
 // 修正②：hasOwnProperty で空文字("")を正しく判定し、falsyバグを解消
@@ -4996,8 +5155,13 @@ async function fetchActiveEvent(){
 // リモート取得失敗（ネットワークエラー等）時のみ localStorage のコードにフォールバック
 async function resolveActiveEventCode(){
   const remote=await fetchActiveEvent();
-  if(remote&&remote.hasOwnProperty('activeEventCode'))return remote.activeEventCode||null;
-  // ネットワークエラー等でremoteがnullの場合のみフォールバック
+  if(remote){
+    // 【1-2】開催中が複数あるときは、ホームで選んだ大会を使う。
+    //   1つだけなら今までどおり自動で決まる。未選択で複数のときは null（＝ホームで選んでもらう）。
+    const row=pickLiveRow(remote.liveEvents||[]);
+    return row?String(row.event_code||''):null;
+  }
+  // ネットワークエラー等でremoteがnullの場合のみ localStorage のコードにフォールバック
   console.warn('resolveActiveEventCode: リモート取得失敗、localStorageにフォールバック');
   return AD.activeEventCode||null;
 }
@@ -5130,6 +5294,9 @@ function showVenueModal(idx){
   const d=v.detail||{};
   const curColor=v.themeColor||'';
   let _mapImage=d.mapImage||''; // 会場マップ画像（data URL）。アップロードで更新される。
+  // 【1-2】マップ画像を別ファイルに切り出したとき、その置き場所（URL）がここに入る。
+  //   編集して保存し直しても消えないよう、そのまま持ち回す。
+  let _mapImageUrl=d.mapImageUrl||'';
   const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   const notesText=Array.isArray(d.notes)?d.notes.join('\n'):'';
   const sectionsText=Array.isArray(d.sections)?d.sections.map(s=>((s.title||'')+' | '+(s.body||''))).join('\n'):'';
@@ -5206,17 +5373,19 @@ function showVenueModal(idx){
       access:gv('v-access'),parking:gv('v-parking'),toilet:gv('v-toilet'),
       smoking:gv('v-smoking'),garbage:gv('v-garbage'),rules:gv('v-rules'),
       mapImage:_mapImage,
+      mapImageUrl:_mapImageUrl,
       notes,sections
     };
   };
   // 会場マップ画像のプレビュー表示を更新する
   function renderMapImg(){
     const w=document.getElementById('v-mapimg-preview');if(!w)return;
-    w.innerHTML=_mapImage
-      ? `<img src="${_mapImage}" style="width:100%;max-height:220px;object-fit:contain;border:1px solid #e5e7eb;border-radius:8px;background:#fff;display:block;"/>`
+    const _src=_mapImage||_mapImageUrl;
+    w.innerHTML=_src
+      ? `<img src="${_src}" style="width:100%;max-height:220px;object-fit:contain;border:1px solid #e5e7eb;border-radius:8px;background:#fff;display:block;"/>`
       : `<div style="font-size:12px;color:#9ca3af;padding:14px;border:1px dashed #d1d5db;border-radius:8px;text-align:center;">まだ画像がありません</div>`;
     const lbl=document.getElementById('v-mapimg-size');
-    if(lbl)lbl.textContent=_mapImage?('およそ '+Math.round(_mapImage.length*0.75/1024)+' KB'):'';
+    if(lbl)lbl.textContent=_mapImage?('およそ '+Math.round(_mapImage.length*0.75/1024)+' KB'):(_mapImageUrl?'別ファイルに保存済み（軽量）':'');
   }
   // 入力欄に detail を流し込む（テンプレ読込用）
   const fillDetail=det=>{
@@ -5227,7 +5396,7 @@ function showVenueModal(idx){
     set('v-smoking',det.smoking);set('v-garbage',det.garbage);set('v-rules',det.rules);
     set('v-notes',Array.isArray(det.notes)?det.notes.join('\n'):'');
     set('v-sections',Array.isArray(det.sections)?det.sections.map(s=>((s.title||'')+' | '+(s.body||''))).join('\n'):'');
-    if(det.mapImage!==undefined){_mapImage=det.mapImage||'';renderMapImg();}
+    if(det.mapImage!==undefined||det.mapImageUrl!==undefined){_mapImage=det.mapImage||'';_mapImageUrl=det.mapImageUrl||'';renderMapImg();}
   };
 
   // 会場マップ画像：選ぶ／削除
@@ -5235,12 +5404,12 @@ function showVenueModal(idx){
   const _mapFile=document.getElementById('v-mapimg-file');
   if(_mapFile)_mapFile.onchange=async()=>{
     const f=_mapFile.files&&_mapFile.files[0];if(!f)return;
-    try{_mapImage=await compressImageFile(f,1280,0.7);renderMapImg();}
+    try{_mapImage=await compressImageFile(f,1280,0.7);_mapImageUrl='';renderMapImg();}
     catch(e){alert('画像の読み込みに失敗しました。別の画像でお試しください。');}
     _mapFile.value='';
   };
   const _mapClear=document.getElementById('v-mapimg-clear');
-  if(_mapClear)_mapClear.onclick=()=>{_mapImage='';renderMapImg();};
+  if(_mapClear)_mapClear.onclick=()=>{_mapImage='';_mapImageUrl='';renderMapImg();};
 
   // テーマカラーの選択
   overlay._themeColor=curColor;
@@ -5775,9 +5944,9 @@ function rTournamentInfo(){
               ${d.address?`<div style="font-size:13px;color:#6b7280;margin-top:5px;">${esc(d.address)}</div>`:''}
               ${safeMap?`<a href="${esc(safeMap)}" target="_blank" rel="noopener" style="display:inline-block;margin-top:10px;font-size:13px;font-weight:700;color:#0a6e57;text-decoration:none;">🗺 地図を開く ▸</a>`:''}
             </div>
-            ${d.mapImage?`<div style="padding:14px 2px;border-bottom:1px solid #f3f4f6;">
+            ${(d.mapImage||d.mapImageUrl)?`<div style="padding:14px 2px;border-bottom:1px solid #f3f4f6;">
               <div style="font-size:12px;color:#9ca3af;font-weight:700;margin-bottom:8px;">🗺 会場マップ（トイレ・本部などの位置）</div>
-              <img src="${d.mapImage}" alt="会場マップ" style="width:100%;border-radius:10px;border:1px solid #e5e7eb;display:block;" />
+              <img src="${d.mapImage||d.mapImageUrl}" alt="会場マップ" loading="lazy" style="width:100%;border-radius:10px;border:1px solid #e5e7eb;display:block;" />
             </div>`:''}
             ${row('🚉','アクセス',d.access)}
             ${row('🅿','駐車場',d.parking)}
@@ -7840,6 +8009,42 @@ function bind(){
     }
   };
 
+  // 【1-2】新アプリの「開催中リスト」を反映するボタン（複数OK）
+  const bsl=document.getElementById('btn-save-live');
+  if(bsl)bsl.onclick=async()=>{
+    const inp=document.getElementById('admin-sb-key');
+    const msg=document.getElementById('admin-live-msg');
+    const say=(t,ng)=>{if(msg){msg.style.color=ng?'#b91c1c':'#166534';msg.textContent=t;}};
+    const key=((inp&&inp.value)||'').trim();
+    if(!key){say('配信キーを入れてください。',true);return;}
+    const keys=[];
+    document.querySelectorAll('.admin-live-chk').forEach(c=>{if(c.checked)keys.push(String(c.dataset.key||''));});
+    const rows=keys.map((k,i)=>{
+      const p=String(k).split('_');
+      const t=(AD.tournaments||[]).find(x=>((x.venueCode?x.venueCode+'_':'')+x.eventCode)===k);
+      return{event_key:k,venue_code:p[0]||'',event_code:p.slice(1).join('_')||'',
+             label:(t&&(t.displayName||t.eventName))||'',sort_order:i};
+    });
+    if(keys.length&&!confirm('新アプリの「開催中」を、この'+keys.length+'件に置き換えます。よろしいですか？\n（従来アプリには影響しません）'))return;
+    if(!keys.length&&!confirm('新アプリの「開催中」を、すべて解除します。よろしいですか？\n（従来アプリには影響しません）'))return;
+    const orig=bsl.textContent;bsl.disabled=true;bsl.textContent='反映中…';
+    try{
+      const res=await fetch(SB_URL+'/rest/v1/rpc/set_live_events',{
+        method:'POST',
+        headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON,'Content-Type':'application/json'},
+        body:JSON.stringify({p_key:key,p_rows:rows})});
+      if(res.ok){
+        AD.sbSyncKey=key;AD.liveKeys=keys;saveAdmin(AD);
+        clearLiveMemo();S._liveEvents=undefined;S._liveEventCode=undefined;_liveEvtTs=0;
+        say('✅ 反映しました（'+keys.length+'件）');
+      }else{
+        const t=await res.text();
+        say('❌ 反映できませんでした（'+res.status+'）'+(t.indexOf('合言葉')>=0?'：配信キーが違います':''),true);
+      }
+    }catch(e){ say('❌ 通信に失敗しました',true); }
+    bsl.disabled=false;bsl.textContent=orig;
+  };
+
   // 配信中にするボタン
   document.querySelectorAll('.admin-set-active').forEach(btn=>{
     btn.addEventListener('click',async()=>{
@@ -8437,6 +8642,21 @@ function bind(){
   // ホーム：パーソナライズ解除
   const bcmt=document.getElementById('btn-clear-myteam');
   if(bcmt)bcmt.onclick=()=>{clearMyTeam();render();};
+  // 【1-2】開催中が2つ以上のとき：見る大会を選ぶ
+  document.querySelectorAll('.live-pick').forEach(b=>{
+    b.onclick=()=>{
+      setSelectedLiveKey(b.dataset.key||'');
+      S._liveEventCode=undefined;S._liveTourId=null;_liveEvtTs=0;
+      render();
+    };
+  });
+  // 【1-2】選び直す
+  const bswl=document.getElementById('btn-switch-live');
+  if(bswl)bswl.onclick=()=>{
+    setSelectedLiveKey('');
+    S._liveEventCode=undefined;S._liveTourId=null;_liveEvtTs=0;
+    render();
+  };
   // 大会情報サブ画面へのショートカット共通処理
   async function openTournamentInfoView(view){
     // 【体感速度改善】先に画面遷移してローディング表示し、通信は裏で実行する
